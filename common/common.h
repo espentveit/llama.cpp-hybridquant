@@ -198,6 +198,7 @@ struct common_params_model {
     std::string hf_repo     = ""; // HF repo                                                // NOLINT
     std::string hf_file     = ""; // HF file                                                // NOLINT
     std::string docker_repo = ""; // Docker repo                                            // NOLINT
+    bool hyb_enable         = false; // enable hybrid helper overlays when present
 };
 
 struct common_params_speculative {

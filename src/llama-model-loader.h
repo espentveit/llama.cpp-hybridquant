@@ -94,6 +94,9 @@ struct llama_model_loader {
     };
 
     std::unordered_map<std::string, hyb_helper_meta> hyb_meta;
+    bool hyb_enabled = true;
+    int  n_hyb_helper_tensors = 0;
+    size_t hyb_helper_bytes = 0;
 
     std::string arch_name;
     LLM_KV      llm_kv    = LLM_KV(LLM_ARCH_UNKNOWN);
@@ -179,8 +182,14 @@ struct llama_model_loader {
     void print_info() const;
 
     const hyb_helper_meta * get_hyb_helper_meta(const std::string & name) const;
+    bool has_hybrid_helpers() const { return n_hyb_helper_tensors > 0; }
+    int  hybrid_helper_tensor_count() const { return n_hyb_helper_tensors; }
+    size_t hybrid_helper_total_bytes() const { return hyb_helper_bytes; }
+    void set_hyb_enabled(bool enabled);
+    bool is_hyb_enabled() const { return hyb_enabled; }
 
 private:
+    static bool is_helper_tensor_name(const std::string & name);
     void parse_hyb_metadata(const struct gguf_context * ctx);
     static ggml_type hyb_type_from_string(const std::string & name);
 };

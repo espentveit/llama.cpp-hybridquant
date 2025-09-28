@@ -2309,6 +2309,10 @@ llama_context * llama_init_from_model(
         return nullptr;
     }
 
+    if (model->has_hybrid_helpers()) {
+        LLAMA_LOG_INFO("%s: *** STARTING INFERENCE WITH HYBRID QUANTIZATION ***\n", __func__);
+    }
+
     if (params.n_batch == 0 && params.n_ubatch == 0) {
         LLAMA_LOG_ERROR("%s: n_batch and n_ubatch cannot both be zero\n", __func__);
         return nullptr;

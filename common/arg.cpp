@@ -3165,6 +3165,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_HF_REPO"));
     add_opt(common_arg(
+        {"--hyb-enable"},
+        "load hybrid helper overlays when present",
+        [](common_params & params) {
+            params.model.hyb_enable = true;
+        }
+    ));
+    add_opt(common_arg(
+        {"--hyb-disable"},
+        string_format("ignore hybrid helper overlays when present (default: %s)", params.model.hyb_enable ? "false" : "true"),
+        [](common_params & params) {
+            params.model.hyb_enable = false;
+        }
+    ));
+    add_opt(common_arg(
         {"-hfd", "-hfrd", "--hf-repo-draft"}, "<user>/<model>[:quant]",
         "Same as --hf-repo, but for the draft model (default: unused)",
         [](common_params & params, const std::string & value) {

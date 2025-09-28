@@ -91,6 +91,14 @@ ggml_type llama_model_loader::hyb_type_from_string(const std::string & name) {
     return GGML_TYPE_COUNT;
 }
 
+bool llama_model_loader::is_helper_tensor_name(const std::string & name) {
+    static const std::string suffix = ".helper";
+    if (name.length() < suffix.length()) {
+        return false;
+    }
+    return std::equal(suffix.rbegin(), suffix.rend(), name.rbegin());
+}
+
 void llama_model_loader::parse_hyb_metadata(const struct gguf_context * ctx) {
     if (!ctx) {
         return;
@@ -110,7 +118,7 @@ void llama_model_loader::parse_hyb_metadata(const struct gguf_context * ctx) {
         }
 
         std::string rest(key + prefix_len);
-        const size_t dot_pos = rest.find('.');
+        const size_t dot_pos = rest.rfind('.');
         if (dot_pos == std::string::npos) {
             continue;
         }
@@ -604,6 +612,11 @@ llama_model_loader::llama_model_loader(
         n_elements += ggml_nelements(cur);
         n_bytes    += ggml_nbytes(cur);
         weights_map.emplace(tensor_name, llama_tensor_weight(files.back().get(), 0, meta.get(), cur));
+
+        if (is_helper_tensor_name(tensor_name)) {
+            ++n_hyb_helper_tensors;
+            hyb_helper_bytes += ggml_nbytes(cur);
+        }
     }
     uint16_t n_split = 0;
     get_key(llm_kv(LLM_KV_SPLIT_COUNT), n_split, false);
@@ -672,6 +685,11 @@ llama_model_loader::llama_model_loader(
                 n_elements += ggml_nelements(cur);
                 n_bytes    += ggml_nbytes(cur);
                 weights_map.emplace(tensor_name, llama_tensor_weight(files.back().get(), idx, ctx_gguf.get(), cur));
+
+                if (is_helper_tensor_name(tensor_name)) {
+                    ++n_hyb_helper_tensors;
+                    hyb_helper_bytes += ggml_nbytes(cur);
+                }
             }
         }
 
@@ -929,8 +947,21 @@ struct ggml_tensor * llama_model_loader::create_tensor_as_view(struct ggml_conte
 }
 
 void llama_model_loader::done_getting_tensors() const {
-    if (n_created != n_tensors) {
-        throw std::runtime_error(format("%s: wrong number of tensors; expected %d, got %d", __func__, n_tensors, n_created));
+    // When hybrid mode is enabled, we expect base tensors + successfully created helper tensors
+    // When hybrid mode is disabled, we expect only base tensors (n_tensors - n_hyb_helper_tensors)
+    // Since helper tensors are created on-demand, we can't predict the exact count for hybrid mode
+    // So we only validate the count when hybrid mode is disabled
+    if (!hyb_enabled) {
+        const int expected = n_tensors - n_hyb_helper_tensors;
+        if (n_created != expected) {
+            LLAMA_LOG_ERROR("%s: tensor count mismatch - hyb_enabled=%s, n_tensors=%d, n_hyb_helper_tensors=%d, expected=%d, n_created=%d\n",
+                            __func__, hyb_enabled ? "true" : "false", n_tensors, n_hyb_helper_tensors, expected, n_created);
+            throw std::runtime_error(format("%s: wrong number of tensors; expected %d, got %d", __func__, expected, n_created));
+        }
+    } else {
+        // For hybrid mode, just log the tensor counts for debugging
+        LLAMA_LOG_INFO("%s: hybrid mode enabled - n_tensors=%d, n_hyb_helper_tensors=%d, n_created=%d\n",
+                       __func__, n_tensors, n_hyb_helper_tensors, n_created);
     }
 }
 
@@ -962,9 +993,17 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
     }
 
     // compute the total size of all tensors for progress reporting
+    size_data = 0;
     for (const auto & it : weights_map) {
+        if (!hyb_enabled && is_helper_tensor_name(it.first)) {
+            continue;
+        }
         size_data += ggml_nbytes(it.second.tensor);
     }
+}
+
+void llama_model_loader::set_hyb_enabled(bool enabled) {
+    hyb_enabled = enabled;
 }
 
 void llama_model_loader::get_mapping_range(size_t * first, size_t * last, void ** addr, int idx, ggml_context * ctx) const {

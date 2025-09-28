@@ -8,6 +8,7 @@
 #include <cstring>
 #include <cinttypes>
 #include <fstream>
+#include <cstdio>
 #include <limits>
 #include <mutex>
 #include <regex>
@@ -755,6 +756,8 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
         }
     }
     std::vector<gguf_context_ptr> ctx_outs(n_split);
+    std::vector<size_t> meta_placeholders(n_split, 0);
+    std::vector<std::string> split_fnames(n_split);
     ctx_outs[0] = std::move(ctx_out);
 
     for (uint16_t i = 0; i < n_split; ++i) {
@@ -775,13 +778,55 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
     int cur_split = -1;
     std::ofstream fout;
     auto close_ofstream = [&]() {
-        // Write metadata and close file handler
-        if (fout.is_open()) {
-            fout.seekp(0);
-            std::vector<uint8_t> data(gguf_get_meta_size(ctx_outs[cur_split].get()));
-            gguf_get_meta_data(ctx_outs[cur_split].get(), data.data());
-            fout.write((const char *) data.data(), data.size());
-            fout.close();
+        if (!fout.is_open()) {
+            return;
+        }
+
+        fout.flush();
+        fout.close();
+
+        const size_t meta_size = gguf_get_meta_size(ctx_outs[cur_split].get());
+        const size_t placeholder = meta_placeholders[cur_split];
+        const std::string & fname = split_fnames[cur_split];
+
+        std::ifstream fin(fname, std::ios::binary);
+        if (!fin) {
+            throw std::runtime_error(format("failed to reopen %s for metadata rewrite", fname.c_str()));
+        }
+
+        const std::string tmp_fname = fname + ".tmp";
+        std::ofstream fout_tmp(tmp_fname, std::ios::binary | std::ios::trunc);
+        if (!fout_tmp) {
+            throw std::runtime_error(format("failed to create temporary file %s", tmp_fname.c_str()));
+        }
+
+        std::vector<uint8_t> meta(meta_size);
+        gguf_get_meta_data(ctx_outs[cur_split].get(), meta.data());
+        fout_tmp.write(reinterpret_cast<const char *>(meta.data()), meta.size());
+        zeros(fout_tmp, GGML_PAD(meta_size, align) - meta_size);
+
+        if (placeholder > 0) {
+            fin.seekg(static_cast<std::streamoff>(placeholder), std::ios::beg);
+        }
+
+        std::vector<char> buffer(1 << 20);
+        while (fin) {
+            fin.read(buffer.data(), buffer.size());
+            const std::streamsize got = fin.gcount();
+            if (got <= 0) {
+                break;
+            }
+            fout_tmp.write(buffer.data(), got);
+        }
+
+        fin.close();
+        fout_tmp.close();
+
+        if (std::remove(fname.c_str()) != 0) {
+            throw std::runtime_error(format("failed to replace original file %s", fname.c_str()));
+        }
+        if (std::rename(tmp_fname.c_str(), fname.c_str()) != 0) {
+            throw std::runtime_error(format("failed to rename temporary file %s", tmp_fname.c_str()));
         }
     };
     auto new_ofstream = [&](int index) {
@@ -799,6 +844,8 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
         const size_t meta_size = gguf_get_meta_size(ctx_outs[cur_split].get());
         // placeholder for the meta data
         ::zeros(fout, meta_size);
+        meta_placeholders[cur_split] = meta_size;
+        split_fnames[cur_split] = fname;
     };
 
     const auto tn = LLM_TN(model.arch);
@@ -1125,10 +1172,25 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                                     workers,
                                     nthread_use);
 
+                            const size_t helper_rows_written = helper_row_size > 0 ? helper_size / helper_row_size : 0;
+                            if (helper_row_size == 0 || helper_size % helper_row_size != 0) {
+                                LLAMA_LOG_WARN("helper row size mismatch for %s: bytes=%zu row_size=%zu\n",
+                                        name.c_str(), helper_size, helper_row_size);
+                            }
+
+                            helper_rows = helper_rows_written;
+                            const size_t helper_size_aligned = helper_row_size * helper_rows;
+                            if (helper_size != helper_size_aligned) {
+                                LLAMA_LOG_WARN("helper size adjusted for %s: raw=%zu aligned=%zu\n",
+                                        name.c_str(), helper_size, helper_size_aligned);
+                            }
+
+                            helper_size = helper_size_aligned;
+                            helper_data.resize(helper_size);
                             helper_block_start = start_tile;
                             helper_block_end = end_tile_exclusive ? (uint32_t) (end_tile_exclusive - 1) : (uint32_t) start_tile;
                             helper_fraction_real = helper_rows > 0 ? float(helper_rows) / float(nrows) : 0.0f;
-                            helper_generated = helper_size > 0;
+                            helper_generated = helper_size > 0 && helper_rows > 0;
                         }
                     }
                 }
