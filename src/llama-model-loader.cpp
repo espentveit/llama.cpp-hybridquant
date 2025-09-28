@@ -1006,6 +1006,23 @@ void llama_model_loader::set_hyb_enabled(bool enabled) {
     hyb_enabled = enabled;
 }
 
+double llama_model_loader::hybrid_helper_avg_fraction() const {
+    if (hyb_meta.empty()) {
+        return 0.0;
+    }
+    double sum = 0.0;
+    int cnt = 0;
+    for (const auto & kv : hyb_meta) {
+        const auto & m = kv.second;
+        if (m.fraction > 0.0f) {
+            sum += m.fraction;
+            ++cnt;
+        }
+    }
+    if (cnt == 0) return 0.0;
+    return sum / cnt;
+}
+
 void llama_model_loader::get_mapping_range(size_t * first, size_t * last, void ** addr, int idx, ggml_context * ctx) const {
     GGML_ASSERT(!mappings.empty());
     const auto & mapping = mappings.at(idx);

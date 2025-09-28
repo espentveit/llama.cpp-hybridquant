@@ -111,12 +111,19 @@ static int llama_model_load(const std::string & fname, std::vector<std::string> 
         llama_model_loader ml(fname, splits, params.use_mmap, params.check_tensors, params.kv_overrides, params.tensor_buft_overrides);
 
         ml.set_hyb_enabled(params.hyb_enable);
-        if (!params.hyb_enable && ml.has_hybrid_helpers()) {
-            const int helper_tensors = ml.hybrid_helper_tensor_count();
-            const double helper_mib = ml.hybrid_helper_total_bytes() / (1024.0 * 1024.0);
-            LLAMA_LOG_INFO("%s: hybrid helper overlays present (%d tensors, %.2f MiB) — run with --hyb-enable to activate\n",
-                    __func__, helper_tensors, helper_mib);
-        }
+    if (!params.hyb_enable && ml.has_hybrid_helpers()) {
+        const int helper_tensors = ml.hybrid_helper_tensor_count();
+        const double helper_mib = ml.hybrid_helper_total_bytes() / (1024.0 * 1024.0);
+        const double avg_cov = ml.hybrid_helper_avg_fraction() * 100.0;
+        LLAMA_LOG_INFO("%s: hybrid helper overlays present (%d tensors, avg coverage %.1f%%, %.2f MiB) — run with --hyb-enable to activate\n",
+            __func__, helper_tensors, avg_cov, helper_mib);
+    } else if (params.hyb_enable && ml.has_hybrid_helpers()) {
+        const int helper_tensors = ml.hybrid_helper_tensor_count();
+        const double helper_mib = ml.hybrid_helper_total_bytes() / (1024.0 * 1024.0);
+        const double avg_cov = ml.hybrid_helper_avg_fraction() * 100.0;
+        LLAMA_LOG_INFO("%s: hybrid helper overlays enabled (%d tensors, avg coverage %.1f%%, extra %.2f MiB)\n",
+            __func__, helper_tensors, avg_cov, helper_mib);
+    }
 
         ml.print_info();
 

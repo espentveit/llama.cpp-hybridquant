@@ -185,6 +185,8 @@ struct llama_model_loader {
     bool has_hybrid_helpers() const { return n_hyb_helper_tensors > 0; }
     int  hybrid_helper_tensor_count() const { return n_hyb_helper_tensors; }
     size_t hybrid_helper_total_bytes() const { return hyb_helper_bytes; }
+    // average of per-tensor helper fractions recorded in GGUF metadata (0.0-1.0)
+    double hybrid_helper_avg_fraction() const;
     void set_hyb_enabled(bool enabled);
     bool is_hyb_enabled() const { return hyb_enabled; }
 
