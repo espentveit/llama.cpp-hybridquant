@@ -18,6 +18,7 @@
 #include <cmath>
 #include <cfloat>
 #include <cstring>
+#include <unordered_map>
 #include <cmath>
 #include <functional>
 #include <map>
@@ -426,6 +427,8 @@ struct llama_model::impl {
 
     buft_list_t cpu_buft_list;
     std::map<ggml_backend_dev_t, buft_list_t> gpu_buft_list;
+
+    std::unordered_map<const ggml_tensor *, llama_model::hybrid_helper_info> hyb_helpers;
 
     struct layer_dev {
         ggml_backend_dev_t dev;
@@ -2188,7 +2191,70 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         ggml_backend_buffer_type_t first_moved_from_buft = nullptr;
         ggml_backend_buffer_type_t first_moved_to_buft = nullptr;
 
-        auto create_tensor = [&](const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) -> ggml_tensor * {
+    auto attach_helper = [&](ggml_tensor * base, ggml_context * tensor_ctx) {
+        if (!base || !params.hyb_enable) {
+            return;
+        }
+
+        const char * base_name = ggml_get_name(base);
+        const auto * meta = ml.get_hyb_helper_meta(base_name);
+        if (meta == nullptr || meta->helper_type == GGML_TYPE_COUNT) {
+            return;
+        }
+
+        if (meta->tile_size == 0) {
+            return;
+        }
+
+        const std::string helper_name = std::string(base_name) + ".helper";
+        const ggml_tensor * helper_meta = ml.get_tensor_meta(helper_name.c_str());
+        if (helper_meta == nullptr) {
+            LLAMA_LOG_WARN("%s: helper metadata present but tensor '%s' missing\n", __func__, helper_name.c_str());
+            return;
+        }
+
+        ggml_tensor * helper_tensor = nullptr;
+        const int nd = ggml_n_dims(helper_meta);
+        switch (nd) {
+            case 1:
+                helper_tensor = ml.create_tensor(tensor_ctx, helper_name, { helper_meta->ne[0] }, llama_model_loader::TENSOR_NOT_REQUIRED);
+                break;
+            case 2:
+                helper_tensor = ml.create_tensor(tensor_ctx, helper_name, { helper_meta->ne[0], helper_meta->ne[1] }, llama_model_loader::TENSOR_NOT_REQUIRED);
+                break;
+            case 3:
+                helper_tensor = ml.create_tensor(tensor_ctx, helper_name, { helper_meta->ne[0], helper_meta->ne[1], helper_meta->ne[2] }, llama_model_loader::TENSOR_NOT_REQUIRED);
+                break;
+            case 4:
+                helper_tensor = ml.create_tensor(tensor_ctx, helper_name, { helper_meta->ne[0], helper_meta->ne[1], helper_meta->ne[2], helper_meta->ne[3] }, llama_model_loader::TENSOR_NOT_REQUIRED);
+                break;
+            default:
+                LLAMA_LOG_WARN("%s: unsupported helper tensor rank %d for %s\n", __func__, nd, helper_name.c_str());
+                return;
+        }
+
+        if (!helper_tensor) {
+            return;
+        }
+
+        llama_model::hybrid_helper_info info;
+        info.tensor = helper_tensor;
+        info.tile_size = meta->tile_size;
+        info.fraction = meta->fraction;
+        info.start_row = std::min<int64_t>((int64_t) meta->block_start * meta->tile_size, base->ne[1]);
+        const int64_t max_rows = base->ne[1] > info.start_row ? base->ne[1] - info.start_row : 0;
+        info.rows = std::min<int64_t>(helper_tensor->ne[1], max_rows);
+
+        if (info.rows <= 0) {
+            LLAMA_LOG_WARN("%s: helper tensor '%s' has no valid rows to apply (start=%lld, base_rows=%lld)\n",
+                    __func__, helper_name.c_str(), (long long) info.start_row, (long long) base->ne[1]);
+            return;
+        }
+
+        pimpl->hyb_helpers.emplace(base, info);
+    };
+
+    auto create_tensor = [&](const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) -> ggml_tensor * {
             ggml_tensor * t_meta = ml.get_tensor_meta(tn.str().c_str());
 
             if (!t_meta) {
@@ -2323,7 +2389,12 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                     return t;
                 }
             }
-            return ml.create_tensor(ctx, tn, ne, flags);
+
+            ggml_tensor * tensor = ml.create_tensor(ctx, tn, ne, flags);
+            if (tensor) {
+                attach_helper(tensor, ctx);
+            }
+            return tensor;
         };
 
         layers.resize(n_layer);
@@ -6193,6 +6264,23 @@ void llama_model::print_info() const {
     // general kv
     LLAMA_LOG_INFO("%s: general.name     = %s\n",    __func__, name.c_str());
 
+    if (has_hybrid_helpers()) {
+        double coverage_sum = 0.0;
+        size_t helper_bytes = 0;
+        for (const auto & kv : pimpl->hyb_helpers) {
+            const ggml_tensor * base_tensor = kv.first;
+            const auto & info = kv.second;
+            if (base_tensor && base_tensor->ne[1] > 0) {
+                coverage_sum += double(info.rows) / double(base_tensor->ne[1]);
+            }
+            helper_bytes += ggml_nbytes(info.tensor);
+        }
+        const double avg_coverage = coverage_sum / pimpl->hyb_helpers.size();
+        LLAMA_LOG_INFO("%s: hybrid helpers   = %zu tensors (avg coverage %.2f%%, extra %.2f MiB)\n",
+                __func__, pimpl->hyb_helpers.size(), avg_coverage * 100.0,
+                helper_bytes / 1024.0 / 1024.0);
+    }
+
     if (arch == LLM_ARCH_DEEPSEEK) {
         LLAMA_LOG_INFO("%s: n_layer_dense_lead   = %d\n",     __func__, hparams.n_layer_dense_lead);
         LLAMA_LOG_INFO("%s: n_ff_exp             = %d\n",     __func__, hparams.n_ff_exp);
@@ -6328,6 +6416,21 @@ const ggml_tensor * llama_model::get_tensor(const char * name) const {
     }
 
     return it->second;
+}
+
+const llama_model::hybrid_helper_info * llama_model::get_hybrid_helper(const struct ggml_tensor * base) const {
+    if (!base) {
+        return nullptr;
+    }
+    auto it = pimpl->hyb_helpers.find(base);
+    if (it == pimpl->hyb_helpers.end()) {
+        return nullptr;
+    }
+    return &it->second;
+}
+
+bool llama_model::has_hybrid_helpers() const {
+    return !pimpl->hyb_helpers.empty();
 }
 
 float llama_model::get_rope_freq_base (const llama_cparams & cparams, int il) const {
@@ -19649,6 +19752,7 @@ llama_model_params llama_model_default_params() {
         /*.use_mlock                   =*/ false,
         /*.check_tensors               =*/ false,
         /*.use_extra_bufts             =*/ true,
+        /*.hyb_enable                  =*/ false,
     };
 
     return result;

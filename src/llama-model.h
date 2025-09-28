@@ -479,6 +479,17 @@ struct llama_model {
 
     const struct ggml_tensor * get_tensor(const char * name) const;
 
+    struct hybrid_helper_info {
+        struct ggml_tensor * tensor = nullptr;
+        int64_t start_row = 0;
+        int64_t rows      = 0;
+        uint32_t tile_size = 0;
+        float fraction = 0.0f;
+    };
+
+    const hybrid_helper_info * get_hybrid_helper(const struct ggml_tensor * base) const;
+    bool has_hybrid_helpers() const;
+
     float get_rope_freq_base (const llama_cparams & cparams, int il) const;
     float get_rope_freq_scale(const llama_cparams & cparams, int il) const;
 

@@ -23,6 +23,7 @@ class llama_kv_cache_context;
 class llama_kv_cache_iswa_context;
 class llama_memory_recurrent_context;
 class llama_memory_hybrid_context;
+class llama_model;
 
 // certain models (typically multi-modal) can produce different types of graphs
 enum llm_graph_type {
@@ -411,6 +412,7 @@ struct llm_graph_params {
     const llama_adapter_loras    * loras;
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
+    const llama_model            * model = nullptr;
 
     uint32_t n_outputs;
 
@@ -574,6 +576,7 @@ struct llm_graph_context {
     const llama_adapter_loras    * loras;
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
+    const llama_model            * model;
 
     const llm_graph_cb & cb_func;
 

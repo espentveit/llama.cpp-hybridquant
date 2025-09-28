@@ -296,6 +296,7 @@ extern "C" {
         bool use_mlock;       // force system to keep model in RAM
         bool check_tensors;   // validate model tensor data
         bool use_extra_bufts; // use extra buffer types (used for weight repacking)
+        bool hyb_enable;      // load hybrid helper overlays when available
     };
 
     // NOTE: changing the default values of parameters marked as [EXPERIMENTAL] may cause crashes or incorrect results in certain configurations
@@ -363,6 +364,10 @@ extern "C" {
         void * kv_overrides;                  // pointer to vector containing overrides
         void * tensor_types;                  // pointer to vector containing tensor types
         void * prune_layers;                  // pointer to vector containing layer indices to prune
+        bool   hyb_enable;                    // enable hybrid helper overlay generation
+        float  hyb_helper_fraction;           // fraction of output-channel tiles to capture in helper overlay
+        enum ggml_type hyb_helper_type;       // quantization type for helper overlay data
+        int32_t hyb_tile_size;                // tile size along the output-channel dimension for helper selection
     } llama_model_quantize_params;
 
     typedef struct llama_logit_bias {

@@ -85,6 +85,16 @@ struct llama_model_loader {
     gguf_context_ptr meta;
     std::vector<ggml_context_ptr> contexts;
 
+    struct hyb_helper_meta {
+        uint32_t   tile_size    = 0;
+        ggml_type  helper_type  = GGML_TYPE_COUNT;
+        uint32_t   block_start  = 0;
+        uint32_t   block_end    = 0;
+        float      fraction     = 0.0f;
+    };
+
+    std::unordered_map<std::string, hyb_helper_meta> hyb_meta;
+
     std::string arch_name;
     LLM_KV      llm_kv    = LLM_KV(LLM_ARCH_UNKNOWN);
 
@@ -167,4 +177,10 @@ struct llama_model_loader {
     std::string ftype_name() const;
 
     void print_info() const;
+
+    const hyb_helper_meta * get_hyb_helper_meta(const std::string & name) const;
+
+private:
+    void parse_hyb_metadata(const struct gguf_context * ctx);
+    static ggml_type hyb_type_from_string(const std::string & name);
 };

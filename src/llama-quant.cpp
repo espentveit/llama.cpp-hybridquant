@@ -8,6 +8,7 @@
 #include <cstring>
 #include <cinttypes>
 #include <fstream>
+#include <limits>
 #include <mutex>
 #include <regex>
 #include <thread>
@@ -743,6 +744,7 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
     std::vector<no_init<uint8_t>> read_data;
     std::vector<no_init<uint8_t>> work;
     std::vector<no_init<float>> f32_conv_buf;
+    std::vector<float> hyb_dequant_buf;
 
     uint16_t n_split = 1;
 
@@ -755,14 +757,10 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
     std::vector<gguf_context_ptr> ctx_outs(n_split);
     ctx_outs[0] = std::move(ctx_out);
 
-    // populate the original tensors so we get an initial meta data
-    for (const auto * it : tensors) {
-        uint16_t i_split = params->keep_split ? it->idx : 0;
-        ggml_tensor * tensor = it->tensor;
-        if (!ctx_outs[i_split]) {
-            ctx_outs[i_split].reset(gguf_init_empty());
+    for (uint16_t i = 0; i < n_split; ++i) {
+        if (!ctx_outs[i]) {
+            ctx_outs[i].reset(gguf_init_empty());
         }
-        gguf_add_tensor(ctx_outs[i_split].get(), tensor);
     }
 
     // Set split info if needed
@@ -808,6 +806,10 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
     for (const auto * it : tensors) {
         const auto & weight = *it;
         ggml_tensor * tensor = weight.tensor;
+        const uint16_t i_split = params->keep_split ? weight.idx : 0;
+
+        gguf_add_tensor(ctx_outs[i_split].get(), tensor);
+
         if (weight.idx != cur_split && params->keep_split) {
             close_ofstream();
             new_ofstream(weight.idx);
@@ -918,6 +920,15 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
             quantize = tensor->type != new_type;
         }
 
+        size_t helper_size = 0;
+        std::vector<uint8_t> helper_data;
+        uint32_t helper_block_start = 0;
+        uint32_t helper_block_end = 0;
+        float helper_fraction_real = 0.0f;
+        int64_t helper_rows = 0;
+        int64_t helper_start_row = 0;
+        bool helper_generated = false;
+
         if (!quantize) {
             new_type = tensor->type;
             new_data = tensor->data;
@@ -1024,9 +1035,112 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
 #endif
             }
             LLAMA_LOG_INFO("size = %8.2f MiB -> %8.2f MiB\n", ggml_nbytes(tensor)/1024.0/1024.0, new_size/1024.0/1024.0);
+
+            if (params->hyb_enable && params->hyb_helper_type != GGML_TYPE_COUNT &&
+                    params->hyb_helper_fraction > 0.0f && params->hyb_tile_size > 0 &&
+                    ggml_is_quantized(new_type) && ggml_is_quantized(params->hyb_helper_type) &&
+                    ggml_n_dims(tensor) == 2 && tensor->ne[2] == 1 && tensor->ne[3] == 1) {
+
+                const ggml_type helper_type = params->hyb_helper_type;
+                const int64_t nrows = tensor->ne[1];
+                const int64_t n_per_row = tensor->ne[0];
+                const int tile_size = params->hyb_tile_size;
+                const int64_t n_tiles = (nrows + tile_size - 1) / tile_size;
+
+                if (n_tiles > 0) {
+                    int helper_tiles = (int) std::llround(params->hyb_helper_fraction * n_tiles);
+                    if (params->hyb_helper_fraction > 0.0f && helper_tiles == 0) {
+                        helper_tiles = 1;
+                    }
+                    helper_tiles = std::min<int64_t>(helper_tiles, n_tiles);
+
+                    const ggml_type_traits * base_traits = ggml_get_type_traits(new_type);
+
+                    if (helper_tiles > 0 && base_traits && base_traits->to_float) {
+                        const size_t base_row_size = ggml_row_size(new_type, n_per_row);
+                        const uint8_t * base_bytes = static_cast<const uint8_t *>(new_data);
+
+                        std::vector<double> tile_errors(n_tiles, 0.0);
+
+                        for (int64_t tile = 0; tile < n_tiles; ++tile) {
+                            const int64_t row_start = tile * tile_size;
+                            const int64_t rows_in_tile = std::min<int64_t>(tile_size, nrows - row_start);
+
+                            if (rows_in_tile <= 0) {
+                                continue;
+                            }
+
+                            hyb_dequant_buf.resize(rows_in_tile * n_per_row);
+                            base_traits->to_float(base_bytes + row_start * base_row_size,
+                                                  hyb_dequant_buf.data(),
+                                                  rows_in_tile * n_per_row);
+
+                            const float * orig_rows = f32_data + row_start * n_per_row;
+                            double err = 0.0;
+                            for (int64_t iel = 0; iel < rows_in_tile * n_per_row; ++iel) {
+                                const double diff = (double) orig_rows[iel] - (double) hyb_dequant_buf[iel];
+                                err += diff * diff;
+                            }
+                            tile_errors[tile] = err;
+                        }
+
+                        const int window = helper_tiles;
+                        double window_sum = 0.0;
+                        double best_sum = -std::numeric_limits<double>::infinity();
+                        int best_start = 0;
+                        for (int64_t tile = 0; tile < n_tiles; ++tile) {
+                            window_sum += tile_errors[tile];
+                            if (tile >= window) {
+                                window_sum -= tile_errors[tile - window];
+                            }
+                            if (tile >= window - 1) {
+                                if (window_sum > best_sum) {
+                                    best_sum = window_sum;
+                                    best_start = (int) (tile - window + 1);
+                                }
+                            }
+                        }
+
+                        const int start_tile = best_start;
+                        const int end_tile_exclusive = std::min<int>(start_tile + helper_tiles, (int) n_tiles);
+                        helper_start_row = (int64_t) start_tile * tile_size;
+                        const int64_t end_row = std::min<int64_t>(nrows, (int64_t) end_tile_exclusive * tile_size);
+                        helper_rows = end_row - helper_start_row;
+
+                        if (helper_rows > 0) {
+                            const size_t helper_row_size = ggml_row_size(helper_type, n_per_row);
+                            helper_data.resize(helper_rows * helper_row_size);
+
+                            const float * helper_src = f32_data + helper_start_row * n_per_row;
+                            const float * helper_imatrix = imatrix;
+
+                            helper_size = llama_tensor_quantize_impl(
+                                    helper_type,
+                                    helper_src,
+                                    helper_data.data(),
+                                    chunk_size,
+                                    helper_rows,
+                                    n_per_row,
+                                    helper_imatrix,
+                                    workers,
+                                    nthread_use);
+
+                            helper_block_start = start_tile;
+                            helper_block_end = end_tile_exclusive ? (uint32_t) (end_tile_exclusive - 1) : (uint32_t) start_tile;
+                            helper_fraction_real = helper_rows > 0 ? float(helper_rows) / float(nrows) : 0.0f;
+                            helper_generated = helper_size > 0;
+                        }
+                    }
+                }
+            }
+
         }
+
         total_size_org += ggml_nbytes(tensor);
         total_size_new += new_size;
+        if (helper_generated) {
+            total_size_new += helper_size;
+        }
 
         // update the gguf meta data as we go
         gguf_set_tensor_type(ctx_outs[cur_split].get(), name.c_str(), new_type);
@@ -1036,6 +1150,46 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
         // write tensor data + padding
         fout.write((const char *) new_data, new_size);
         zeros(fout, GGML_PAD(new_size, align) - new_size);
+
+        if (helper_generated) {
+            std::string helper_name = name + ".helper";
+
+            struct ggml_tensor helper_tensor = {};
+            helper_tensor.type = params->hyb_helper_type;
+            helper_tensor.ne[0] = tensor->ne[0];
+            helper_tensor.ne[1] = helper_rows;
+            helper_tensor.ne[2] = 1;
+            helper_tensor.ne[3] = 1;
+            helper_tensor.nb[0] = ggml_type_size(helper_tensor.type);
+            helper_tensor.nb[1] = helper_tensor.nb[0]*(helper_tensor.ne[0]/ggml_blck_size(helper_tensor.type));
+            helper_tensor.nb[2] = helper_tensor.nb[1]*helper_tensor.ne[1];
+            helper_tensor.nb[3] = helper_tensor.nb[2];
+            helper_tensor.op = GGML_OP_NONE;
+            helper_tensor.data = nullptr;
+            helper_tensor.view_src = nullptr;
+            helper_tensor.view_offs = 0;
+            helper_tensor.buffer = nullptr;
+            helper_tensor.extra = nullptr;
+            std::snprintf(helper_tensor.name, GGML_MAX_NAME, "%s", helper_name.c_str());
+
+            gguf_add_tensor(ctx_outs[cur_split].get(), &helper_tensor);
+            gguf_set_tensor_data(ctx_outs[cur_split].get(), helper_name.c_str(), helper_data.data());
+
+            fout.write(reinterpret_cast<const char *>(helper_data.data()), helper_size);
+            zeros(fout, GGML_PAD(helper_size, align) - helper_size);
+
+            const std::string hyb_prefix = format("llama.hyb.%s", name.c_str());
+            gguf_set_val_u32(ctx_outs[cur_split].get(), (hyb_prefix + ".tile_size").c_str(), params->hyb_tile_size);
+            gguf_set_val_str(ctx_outs[cur_split].get(), (hyb_prefix + ".helper_dtype").c_str(), ggml_type_name(params->hyb_helper_type));
+            const uint32_t helper_blocks_arr[2] = { helper_block_start, helper_block_end };
+            gguf_set_arr_data(ctx_outs[cur_split].get(), (hyb_prefix + ".helper_blocks").c_str(), GGUF_TYPE_UINT32, helper_blocks_arr, 2);
+            gguf_set_val_f32(ctx_outs[cur_split].get(), (hyb_prefix + ".helper_fraction").c_str(), helper_fraction_real);
+
+            LLAMA_LOG_INFO("    helper overlay rows [%lld, %lld) covering %.2f%%\n",
+                (long long) helper_start_row,
+                (long long) (helper_start_row + helper_rows),
+                helper_fraction_real * 100.0f);
+        }
     }
     close_ofstream();
 
@@ -1066,7 +1220,11 @@ llama_model_quantize_params llama_model_quantize_default_params() {
         /*.imatrix                     =*/ nullptr,
         /*.kv_overrides                =*/ nullptr,
         /*.tensor_type                 =*/ nullptr,
-        /*.prune_layers                =*/ nullptr
+        /*.prune_layers                =*/ nullptr,
+        /*.hyb_enable                  =*/ false,
+        /*.hyb_helper_fraction         =*/ 0.0f,
+        /*.hyb_helper_type             =*/ GGML_TYPE_COUNT,
+        /*.hyb_tile_size               =*/ 128,
     };
 
     return result;

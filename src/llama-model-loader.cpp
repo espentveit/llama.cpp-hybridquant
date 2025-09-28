@@ -2,7 +2,9 @@
 
 #include "ggml.h"
 
+#include <algorithm>
 #include <array>
+#include <cctype>
 #include <cinttypes>
 #include <cstring>
 #include <future>
@@ -63,6 +65,90 @@ static std::string llama_model_ftype_name(llama_ftype ftype) {
 
         default: return "unknown, may not work";
     }
+}
+
+ggml_type llama_model_loader::hyb_type_from_string(const std::string & name) {
+    if (name.empty()) {
+        return GGML_TYPE_COUNT;
+    }
+
+    std::string upper = name;
+    std::transform(upper.begin(), upper.end(), upper.begin(), [](unsigned char c) { return std::toupper(c); });
+
+    for (int i = 0; i < GGML_TYPE_COUNT; ++i) {
+        ggml_type type = static_cast<ggml_type>(i);
+        const char * type_name = ggml_type_name(type);
+        if (!type_name) {
+            continue;
+        }
+        std::string target = type_name;
+        std::transform(target.begin(), target.end(), target.begin(), [](unsigned char c) { return std::toupper(c); });
+        if (upper == target) {
+            return type;
+        }
+    }
+
+    return GGML_TYPE_COUNT;
+}
+
+void llama_model_loader::parse_hyb_metadata(const struct gguf_context * ctx) {
+    if (!ctx) {
+        return;
+    }
+
+    const int64_t n_kv_local = gguf_get_n_kv(ctx);
+    for (int64_t i = 0; i < n_kv_local; ++i) {
+        const char * key = gguf_get_key(ctx, i);
+        if (!key) {
+            continue;
+        }
+
+        static const char prefix[] = "llama.hyb.";
+        constexpr size_t prefix_len = sizeof(prefix) - 1;
+        if (std::strncmp(key, prefix, prefix_len) != 0) {
+            continue;
+        }
+
+        std::string rest(key + prefix_len);
+        const size_t dot_pos = rest.find('.');
+        if (dot_pos == std::string::npos) {
+            continue;
+        }
+
+        std::string tensor_name = rest.substr(0, dot_pos);
+        std::string field       = rest.substr(dot_pos + 1);
+
+        hyb_helper_meta & meta = hyb_meta[tensor_name];
+
+        if (field == "tile_size") {
+            meta.tile_size = gguf_get_val_u32(ctx, i);
+        } else if (field == "helper_dtype") {
+            const char * dtype = gguf_get_val_str(ctx, i);
+            meta.helper_type = hyb_type_from_string(dtype ? dtype : "");
+        } else if (field == "helper_fraction") {
+            meta.fraction = gguf_get_val_f32(ctx, i);
+        } else if (field == "helper_blocks") {
+            if (gguf_get_kv_type(ctx, i) == GGUF_TYPE_ARRAY && gguf_get_arr_type(ctx, i) == GGUF_TYPE_UINT32) {
+                const size_t count = gguf_get_arr_n(ctx, i);
+                if (count >= 2) {
+                    const uint32_t * data = static_cast<const uint32_t *>(gguf_get_arr_data(ctx, i));
+                    meta.block_start = data[0];
+                    meta.block_end   = data[1];
+                }
+            }
+        }
+    }
+}
+
+const llama_model_loader::hyb_helper_meta * llama_model_loader::get_hyb_helper_meta(const std::string & name) const {
+    auto it = hyb_meta.find(name);
+    if (it == hyb_meta.end()) {
+        return nullptr;
+    }
+    if (it->second.helper_type == GGML_TYPE_COUNT) {
+        return nullptr;
+    }
+    return &it->second;
 }
 
 // return a list of splits for a given path
@@ -504,6 +590,8 @@ llama_model_loader::llama_model_loader(
     files.emplace_back(new llama_file(fname.c_str(), "rb"));
     contexts.emplace_back(ctx);
 
+    parse_hyb_metadata(meta.get());
+
     // Save tensors data offset of the main file.
     // For subsidiary files, `meta` tensor data offset must not be used,
     // so we build a unified tensors index for weights.
@@ -571,6 +659,8 @@ llama_model_loader::llama_model_loader(
 
             files.emplace_back(new llama_file(fname_split, "rb"));
             contexts.emplace_back(ctx);
+
+            parse_hyb_metadata(ctx_gguf.get());
 
             // Save tensors data offset info of the shard.
             for (ggml_tensor * cur = ggml_get_first_tensor(ctx); cur; cur = ggml_get_next_tensor(ctx, cur)) {

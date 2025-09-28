@@ -3,12 +3,14 @@
 #include "llama-impl.h"
 #include "llama-batch.h"
 #include "llama-cparams.h"
+#include "llama-model.h"
 
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
 #include "llama-memory-hybrid.h"
 #include "llama-memory-recurrent.h"
 
+#include <algorithm>
 #include <cassert>
 #include <cmath>
 #include <cstring>
@@ -565,6 +567,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     loras            (params.loras),
     mctx             (params.mctx),
     cross            (params.cross),
+    model            (params.model),
     cb_func          (params.cb),
     res              (params.res),
     ctx0             (res->get_ctx()),
@@ -588,6 +591,33 @@ ggml_tensor * llm_graph_context::build_lora_mm(
           ggml_tensor * w,
           ggml_tensor * cur) const {
     ggml_tensor * res = ggml_mul_mat(ctx0, w, cur);
+
+    if (model && model->params.hyb_enable) {
+        const auto * helper = model->get_hybrid_helper(w);
+        if (helper && helper->tensor && helper->rows > 0) {
+            const int64_t start_row = helper->start_row;
+            if (start_row < res->ne[1]) {
+                const int64_t max_rows = std::min<int64_t>(helper->rows, res->ne[1] - start_row);
+                if (max_rows > 0) {
+                    ggml_tensor * helper_out = ggml_mul_mat(ctx0, helper->tensor, cur);
+                    ggml_tensor * helper_slice = helper_out;
+                    if (max_rows != helper->rows) {
+                        helper_slice = ggml_view_2d(ctx0, helper_out, helper_out->ne[0], max_rows, helper_out->nb[1], 0);
+                    }
+
+                    if (helper_slice->ne[0] == max_rows && helper_slice->ne[1] == res->ne[0]) {
+                        helper_slice = ggml_transpose(ctx0, helper_slice);
+                    } else if (helper_slice->ne[0] != res->ne[0] || helper_slice->ne[1] != max_rows) {
+                        helper_slice = ggml_reshape_2d(ctx0, helper_slice, res->ne[0], max_rows);
+                    }
+
+                    size_t offset = start_row * res->nb[1];
+                    ggml_tensor * res_slice = ggml_view_2d(ctx0, res, res->ne[0], max_rows, res->nb[1], offset);
+                    ggml_add_inplace(ctx0, res_slice, helper_slice);
+                }
+            }
+        }
+    }
 
     for (const auto & lora : *loras) {
         llama_adapter_lora_weight * lw = lora.first->get_weight(w);
@@ -615,6 +645,32 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
           ggml_tensor * cur, // ggml_tensor * b
           ggml_tensor * ids) const {
     ggml_tensor * res = ggml_mul_mat_id(ctx0, w, cur, ids);
+    if (model && model->params.hyb_enable) {
+        const auto * helper = model->get_hybrid_helper(w);
+        if (helper && helper->tensor && helper->rows > 0) {
+            const int64_t start_row = helper->start_row;
+            if (start_row < res->ne[1]) {
+                const int64_t max_rows = std::min<int64_t>(helper->rows, res->ne[1] - start_row);
+                if (max_rows > 0) {
+                    ggml_tensor * helper_out = ggml_mul_mat_id(ctx0, helper->tensor, cur, ids);
+                    ggml_tensor * helper_slice = helper_out;
+                    if (max_rows != helper->rows) {
+                        helper_slice = ggml_view_2d(ctx0, helper_out, helper_out->ne[0], max_rows, helper_out->nb[1], 0);
+                    }
+
+                    if (helper_slice->ne[0] == max_rows && helper_slice->ne[1] == res->ne[0]) {
+                        helper_slice = ggml_transpose(ctx0, helper_slice);
+                    } else if (helper_slice->ne[0] != res->ne[0] || helper_slice->ne[1] != max_rows) {
+                        helper_slice = ggml_reshape_2d(ctx0, helper_slice, res->ne[0], max_rows);
+                    }
+
+                    size_t offset = start_row * res->nb[1];
+                    ggml_tensor * res_slice = ggml_view_2d(ctx0, res, res->ne[0], max_rows, res->nb[1], offset);
+                    ggml_add_inplace(ctx0, res_slice, helper_slice);
+                }
+            }
+        }
+    }
     for (const auto & lora : *loras) {
         llama_adapter_lora_weight * lw = lora.first->get_weight(w);
         if (lw == nullptr) {

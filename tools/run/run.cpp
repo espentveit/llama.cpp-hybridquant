@@ -184,6 +184,10 @@ class Opt {
             verbose = true;
         } else if (options_parsing && strcmp(argv[i], "--jinja") == 0) {
             use_jinja = true;
+        } else if (options_parsing && strcmp(argv[i], "--hyb-enable") == 0) {
+            model_params.hyb_enable = true;
+        } else if (options_parsing && strcmp(argv[i], "--hyb-disable") == 0) {
+            model_params.hyb_enable = false;
         } else if (options_parsing && parse_flag(argv, i, "-h", "--help")) {
             help = true;
             return 0;
@@ -259,6 +263,10 @@ class Opt {
             "      Only supports jinja templates and implicitly sets the --jinja flag.\n"
             "  --jinja\n"
             "      Use jinja templating for the chat template of the model\n"
+            "  --hyb-enable\n"
+            "      Load and evaluate hybrid helper overlays when available\n"
+            "  --hyb-disable\n"
+            "      Ignore hybrid helper overlays even if present\n"
             "  -n, -ngl, --ngl <value>\n"
             "      Number of GPU layers (default: %d)\n"
             "  --temp <value>\n"

@@ -12,6 +12,7 @@
 #include <cmath>
 #include <cctype>
 #include <algorithm>
+#include <limits>
 
 struct quant_option {
     std::string name;
@@ -119,6 +120,7 @@ static bool try_parse_ftype(const std::string & ftype_str_in, llama_ftype & ftyp
 static void usage(const char * executable) {
     printf("usage: %s [--help] [--allow-requantize] [--leave-output-tensor] [--pure] [--imatrix] [--include-weights]\n", executable);
     printf("       [--exclude-weights] [--output-tensor-type] [--token-embedding-type] [--tensor-type] [--prune-layers] [--keep-split] [--override-kv]\n");
+    printf("       [--hyb-enable] [--hyb-disable] [--hyb-helper-type] [--hyb-helper-fraction] [--hyb-tile-size]\n");
     printf("       model-f32.gguf [model-quant.gguf] type [nthreads]\n\n");
     printf("  --allow-requantize: Allows requantizing tensors that have already been quantized. Warning: This can severely reduce quality compared to quantizing from 16bit or 32bit\n");
     printf("  --leave-output-tensor: Will leave output.weight un(re)quantized. Increases model size but may also increase quality, especially when requantizing\n");
@@ -135,6 +137,11 @@ static void usage(const char * executable) {
     printf("  --keep-split: will generate quantized model in the same shards as input\n");
     printf("  --override-kv KEY=TYPE:VALUE\n");
     printf("      Advanced option to override model metadata by key in the quantized model. May be specified multiple times.\n");
+    printf("  --hyb-enable: Generate hybrid helper tensors (default helper type q8_0, fraction 0.2, tile size 128).\n");
+    printf("  --hyb-disable: Disable hybrid helper tensor generation.\n");
+    printf("  --hyb-helper-type ggml_type: Use this quantization type for helper overlays (e.g. q8_0).\n");
+    printf("  --hyb-helper-fraction fraction: Portion of output-channel tiles to capture in helper overlay (0.0-1.0).\n");
+    printf("  --hyb-tile-size N: Tile size along the output-channel dimension for helper selection (default 128).\n");
     printf("Note: --include-weights and --exclude-weights cannot be used together\n");
     printf("\nAllowed quantization types:\n");
     for (const auto & it : QUANT_OPTIONS) {
@@ -453,6 +460,11 @@ int main(int argc, char ** argv) {
     std::vector<llama_model_kv_override> kv_overrides;
     std::vector<tensor_quantization> tensor_types;
     std::vector<int> prune_layers;
+    bool hyb_enabled_cli = false;
+    bool hyb_disabled_cli = false;
+    float hyb_fraction_cli = 0.2f;
+    int hyb_tile_size_cli = params.hyb_tile_size;
+    enum ggml_type hyb_type_cli = GGML_TYPE_Q8_0;
 
     for (; arg_idx < argc && strncmp(argv[arg_idx], "--", 2) == 0; arg_idx++) {
         if (strcmp(argv[arg_idx], "--leave-output-tensor") == 0) {
@@ -511,6 +523,52 @@ int main(int argc, char ** argv) {
             }
         } else if (strcmp(argv[arg_idx], "--keep-split") == 0) {
             params.keep_split = true;
+        } else if (strcmp(argv[arg_idx], "--hyb-enable") == 0) {
+            hyb_enabled_cli = true;
+        } else if (strcmp(argv[arg_idx], "--hyb-disable") == 0) {
+            hyb_enabled_cli = false;
+            hyb_disabled_cli = true;
+        } else if (strcmp(argv[arg_idx], "--hyb-helper-type") == 0) {
+            if (arg_idx < argc - 1) {
+                hyb_type_cli = parse_ggml_type(argv[++arg_idx]);
+                if (hyb_type_cli == GGML_TYPE_COUNT) {
+                    usage(argv[0]);
+                }
+                hyb_enabled_cli = true;
+            } else {
+                usage(argv[0]);
+            }
+        } else if (strcmp(argv[arg_idx], "--hyb-helper-fraction") == 0) {
+            if (arg_idx < argc - 1) {
+                try {
+                    hyb_fraction_cli = std::stof(argv[++arg_idx]);
+                } catch (...) {
+                    usage(argv[0]);
+                }
+                if (hyb_fraction_cli < 0.0f) {
+                    hyb_fraction_cli = 0.0f;
+                }
+                if (hyb_fraction_cli > 1.0f) {
+                    hyb_fraction_cli = 1.0f;
+                }
+                hyb_enabled_cli = true;
+            } else {
+                usage(argv[0]);
+            }
+        } else if (strcmp(argv[arg_idx], "--hyb-tile-size") == 0) {
+            if (arg_idx < argc - 1) {
+                try {
+                    hyb_tile_size_cli = std::stoi(argv[++arg_idx]);
+                } catch (...) {
+                    usage(argv[0]);
+                }
+                if (hyb_tile_size_cli <= 0) {
+                    usage(argv[0]);
+                }
+                hyb_enabled_cli = true;
+            } else {
+                usage(argv[0]);
+            }
         } else {
             usage(argv[0]);
         }
@@ -573,6 +631,24 @@ int main(int argc, char ** argv) {
     }
     if (!prune_layers.empty()) {
         params.prune_layers = &prune_layers;
+    }
+
+    if (hyb_disabled_cli) {
+        hyb_enabled_cli = false;
+    }
+    if (hyb_enabled_cli) {
+        if (!ggml_is_quantized(hyb_type_cli)) {
+            fprintf(stderr, "%s: helper type '%s' is not a quantized ggml type\n", __func__, ggml_type_name(hyb_type_cli));
+            return 1;
+        }
+        params.hyb_enable = true;
+        params.hyb_helper_fraction = hyb_fraction_cli;
+        params.hyb_helper_type = hyb_type_cli;
+        params.hyb_tile_size = hyb_tile_size_cli;
+    } else {
+        params.hyb_enable = false;
+        params.hyb_helper_fraction = 0.0f;
+        params.hyb_helper_type = GGML_TYPE_COUNT;
     }
 
     llama_backend_init();
