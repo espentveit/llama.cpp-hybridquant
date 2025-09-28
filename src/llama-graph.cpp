@@ -596,24 +596,32 @@ ggml_tensor * llm_graph_context::build_lora_mm(
         const auto * helper = model->get_hybrid_helper(w);
         if (helper && helper->tensor && helper->rows > 0) {
             const int64_t start_row = helper->start_row;
-            if (start_row < res->ne[1]) {
-                const int64_t max_rows = std::min<int64_t>(helper->rows, res->ne[1] - start_row);
-                if (max_rows > 0) {
-                    ggml_tensor * helper_out = ggml_mul_mat(ctx0, helper->tensor, cur);
-                    ggml_tensor * helper_slice = helper_out;
-                    if (max_rows != helper->rows) {
-                        helper_slice = ggml_view_2d(ctx0, helper_out, helper_out->ne[0], max_rows, helper_out->nb[1], 0);
+            if (start_row < res->ne[0]) {
+                const int64_t rows = std::min<int64_t>(helper->rows, res->ne[0] - start_row);
+                if (rows > 0) {
+                    ggml_tensor * helper_tensor = helper->tensor;
+                    if (rows != helper->rows) {
+                        helper_tensor = ggml_view_2d(ctx0, helper_tensor, helper_tensor->ne[0], rows, helper_tensor->nb[1], 0);
                     }
 
-                    if (helper_slice->ne[0] == max_rows && helper_slice->ne[1] == res->ne[0]) {
-                        helper_slice = ggml_transpose(ctx0, helper_slice);
-                    } else if (helper_slice->ne[0] != res->ne[0] || helper_slice->ne[1] != max_rows) {
-                        helper_slice = ggml_reshape_2d(ctx0, helper_slice, res->ne[0], max_rows);
+                    ggml_tensor * helper_out = ggml_mul_mat(ctx0, helper_tensor, cur);
+                    helper_out = ggml_cont(ctx0, helper_out);
+
+                    if (rows != helper->rows) {
+                        helper_out = ggml_view_2d(ctx0, helper_out, rows, helper_out->ne[1], helper_out->nb[1], 0);
+                        helper_out = ggml_cont(ctx0, helper_out);
                     }
 
-                    size_t offset = start_row * res->nb[1];
-                    ggml_tensor * res_slice = ggml_view_2d(ctx0, res, res->ne[0], max_rows, res->nb[1], offset);
-                    ggml_add_inplace(ctx0, res_slice, helper_slice);
+                    ggml_tensor * base_tensor = ggml_view_2d(ctx0, w, w->ne[0], rows, w->nb[1], start_row * w->nb[1]);
+                    base_tensor = ggml_cont(ctx0, base_tensor);
+
+                    ggml_tensor * base_out = ggml_mul_mat(ctx0, base_tensor, cur);
+                    base_out = ggml_cont(ctx0, base_out);
+
+                    ggml_tensor * delta = ggml_sub(ctx0, helper_out, base_out);
+
+                    const size_t offset = start_row * res->nb[0];
+                    res = ggml_acc(ctx0, res, delta, res->nb[1], res->nb[2], res->nb[3], offset);
                 }
             }
         }
@@ -649,24 +657,32 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
         const auto * helper = model->get_hybrid_helper(w);
         if (helper && helper->tensor && helper->rows > 0) {
             const int64_t start_row = helper->start_row;
-            if (start_row < res->ne[1]) {
-                const int64_t max_rows = std::min<int64_t>(helper->rows, res->ne[1] - start_row);
-                if (max_rows > 0) {
-                    ggml_tensor * helper_out = ggml_mul_mat_id(ctx0, helper->tensor, cur, ids);
-                    ggml_tensor * helper_slice = helper_out;
-                    if (max_rows != helper->rows) {
-                        helper_slice = ggml_view_2d(ctx0, helper_out, helper_out->ne[0], max_rows, helper_out->nb[1], 0);
+            if (start_row < res->ne[0]) {
+                const int64_t rows = std::min<int64_t>(helper->rows, res->ne[0] - start_row);
+                if (rows > 0) {
+                    ggml_tensor * helper_tensor = helper->tensor;
+                    if (rows != helper->rows) {
+                        helper_tensor = ggml_view_2d(ctx0, helper_tensor, helper_tensor->ne[0], rows, helper_tensor->nb[1], 0);
                     }
 
-                    if (helper_slice->ne[0] == max_rows && helper_slice->ne[1] == res->ne[0]) {
-                        helper_slice = ggml_transpose(ctx0, helper_slice);
-                    } else if (helper_slice->ne[0] != res->ne[0] || helper_slice->ne[1] != max_rows) {
-                        helper_slice = ggml_reshape_2d(ctx0, helper_slice, res->ne[0], max_rows);
+                    ggml_tensor * helper_out = ggml_mul_mat_id(ctx0, helper_tensor, cur, ids);
+                    helper_out = ggml_cont(ctx0, helper_out);
+
+                    if (rows != helper->rows) {
+                        helper_out = ggml_view_2d(ctx0, helper_out, rows, helper_out->ne[1], helper_out->nb[1], 0);
+                        helper_out = ggml_cont(ctx0, helper_out);
                     }
 
-                    size_t offset = start_row * res->nb[1];
-                    ggml_tensor * res_slice = ggml_view_2d(ctx0, res, res->ne[0], max_rows, res->nb[1], offset);
-                    ggml_add_inplace(ctx0, res_slice, helper_slice);
+                    ggml_tensor * base_tensor = ggml_view_2d(ctx0, w, w->ne[0], rows, w->nb[1], start_row * w->nb[1]);
+                    base_tensor = ggml_cont(ctx0, base_tensor);
+
+                    ggml_tensor * base_out = ggml_mul_mat_id(ctx0, base_tensor, cur, ids);
+                    base_out = ggml_cont(ctx0, base_out);
+
+                    ggml_tensor * delta = ggml_sub(ctx0, helper_out, base_out);
+
+                    const size_t offset = start_row * res->nb[0];
+                    res = ggml_acc(ctx0, res, delta, res->nb[1], res->nb[2], res->nb[3], offset);
                 }
             }
         }

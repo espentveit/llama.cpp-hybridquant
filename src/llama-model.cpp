@@ -2213,10 +2213,27 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
             return;
         }
 
-        // Helper tensors are already loaded from GGUF file, just get the existing tensor
-        ggml_tensor * helper_tensor = ggml_get_tensor(tensor_ctx, helper_name.c_str());
-        if (helper_tensor == nullptr) {
-            LLAMA_LOG_WARN("%s: helper tensor '%s' not found in context\n", __func__, helper_name.c_str());
+        ggml_tensor * helper_tensor = nullptr;
+        const int nd = ggml_n_dims(helper_meta);
+        switch (nd) {
+            case 1:
+                helper_tensor = ml.create_tensor(tensor_ctx, helper_name, { helper_meta->ne[0] }, llama_model_loader::TENSOR_NOT_REQUIRED);
+                break;
+            case 2:
+                helper_tensor = ml.create_tensor(tensor_ctx, helper_name, { helper_meta->ne[0], helper_meta->ne[1] }, llama_model_loader::TENSOR_NOT_REQUIRED);
+                break;
+            case 3:
+                helper_tensor = ml.create_tensor(tensor_ctx, helper_name, { helper_meta->ne[0], helper_meta->ne[1], helper_meta->ne[2] }, llama_model_loader::TENSOR_NOT_REQUIRED);
+                break;
+            case 4:
+                helper_tensor = ml.create_tensor(tensor_ctx, helper_name, { helper_meta->ne[0], helper_meta->ne[1], helper_meta->ne[2], helper_meta->ne[3] }, llama_model_loader::TENSOR_NOT_REQUIRED);
+                break;
+            default:
+                LLAMA_LOG_WARN("%s: unsupported helper tensor rank %d for %s\n", __func__, nd, helper_name.c_str());
+                return;
+        }
+
+        if (!helper_tensor) {
             return;
         }
 
@@ -2235,9 +2252,9 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         }
 
         pimpl->hyb_helpers.emplace(base, info);
-        LLAMA_LOG_INFO("%s: attached hybrid helper '%s' to base tensor '%s' (coverage: %.1f%%, rows: %lld)\n",
-                       __func__, helper_name.c_str(), base_name,
-                       (double)info.rows / base->ne[1] * 100.0, (long long)info.rows);
+        // LLAMA_LOG_INFO("%s: attached hybrid helper '%s' to base tensor '%s' (coverage: %.1f%%, rows: %lld)\n",
+        //                __func__, helper_name.c_str(), base_name,
+        //                (double)info.rows / base->ne[1] * 100.0, (long long)info.rows);
     };
 
     auto create_tensor = [&](const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) -> ggml_tensor * {
